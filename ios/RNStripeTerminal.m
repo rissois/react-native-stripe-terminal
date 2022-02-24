@@ -27,12 +27,9 @@ static dispatch_once_t onceToken = 0;
              @"log",
              @"requestConnectionToken",
              @"readersDiscovered",
-             @"readerSoftwareUpdateProgress",
              @"readerDiscoveryCompletion",
              @"readerDisconnectCompletion",
              @"readerConnection",
-             @"updateCheck",
-             @"updateInstall",
              @"paymentCreation",
              @"paymentIntentCreation",
              @"paymentIntentRetrieval",
@@ -106,10 +103,6 @@ static dispatch_once_t onceToken = 0;
     [self sendEventWithName:@"readersDiscovered" body:data];
 }
 
-- (void)terminal:(SCPTerminal *)terminal didReportReaderSoftwareUpdateProgress:(float)progress {
-    [self sendEventWithName:@"readerSoftwareUpdateProgress" body:[NSNumber numberWithFloat:progress]];
-}
-
 - (void)onLogEntry:(NSString * _Nonnull) logline {
     if (self.bridge == nil) {
         return;
@@ -131,7 +124,7 @@ RCT_EXPORT_METHOD(setConnectionToken:(NSString *)token error:(NSString *)errorMe
     }
 }
 
-RCT_EXPORT_METHOD(initialize) {
+RCT_EXPORT_METHOD(initializeTerminal) {
     dispatch_once(&onceToken, ^{
         [SCPTerminal setTokenProvider:self];
     });
@@ -154,8 +147,8 @@ RCT_EXPORT_METHOD(initialize) {
 
 RCT_EXPORT_METHOD(discoverReaders:(NSInteger *)discoveryMethod simulated:(BOOL *)simulated) {
     [self abortDiscoverReaders];
-    SCPDiscoveryConfiguration *config = [[SCPDiscoveryConfiguration alloc] initWithDiscoveryMethod:SCPDiscoveryMethodBluetoothScan
-                                                                                         simulated:NO];
+    SCPDiscoveryConfiguration *config = [[SCPDiscoveryConfiguration alloc] initWithDiscoveryMethod:discoveryMethod
+                                                                                         simulated:simulated];
     pendingDiscoverReaders = [[SCPTerminal shared] discoverReaders:config
                                                            delegate:self
                                                          completion:^(NSError *error) {
@@ -172,6 +165,7 @@ RCT_EXPORT_METHOD(connectReader:(NSString *)serialNumber location:(NSString *)lo
         return [reader.serialNumber isEqualToString:serialNumber];
     }];
 
+    SCPTerminal.shared.simulatorConfiguration.availableReaderUpdate = SCPSimulateReaderUpdateRandom;
     SCPBluetoothConnectionConfiguration *connectionConfig = [[SCPBluetoothConnectionConfiguration alloc] initWithLocationId:locationId];
     [SCPTerminal.shared connectBluetoothReader:readers[readerIndex] delegate: self
                                                             connectionConfig: connectionConfig
@@ -194,21 +188,35 @@ RCT_EXPORT_METHOD(connectReader:(NSString *)serialNumber location:(NSString *)lo
              @"deviceType": @(reader.deviceType),
              @"serialNumber": reader.serialNumber ? reader.serialNumber : @"",
              @"deviceSoftwareVersion": reader.deviceSoftwareVersion ? reader.deviceSoftwareVersion : @"",
-             @"availableUpdate": reader.availableUpdate ? reader.availableUpdate : @"",
+             @"availableUpdate": reader.availableUpdate ? [self serializeUpdate:reader.availableUpdate] : @{},
              };
 }
 
 - (NSDictionary *)serializeUpdate:(SCPReaderSoftwareUpdate *)update {
-    return @{
-             @"estimatedUpdateTime": [SCPReaderSoftwareUpdate stringFromUpdateTimeEstimate:update.estimatedUpdateTime],
-             @"deviceSoftwareVersion": update.deviceSoftwareVersion ? update.deviceSoftwareVersion : @""
-             };
+    NSDictionary *updateDict = @{};
+    if(update){
+        NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+        [formatter setDateFormat:@"yyyy-MM-dd'T'HH:mm:ssZZZZ"];
+        NSString *requiredAt = [formatter stringFromDate:update.requiredAt];
+
+        updateDict = @{
+                    @"estimatedUpdateTime": [SCPReaderSoftwareUpdate stringFromUpdateTimeEstimate:update.estimatedUpdateTime],
+                    @"deviceSoftwareVersion": update.deviceSoftwareVersion ? update.deviceSoftwareVersion : @"",
+                    @"requiredAt": requiredAt,
+        };
+        return @{ @"update": updateDict};
+    }
+    return updateDict;
 }
 
 - (NSDictionary *)serializePaymentIntent:(SCPPaymentIntent *)intent {
+    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+    [formatter setDateFormat:@"yyyy-MM-dd'T'HH:mm:ssZZZZ"];
+    NSString *createdDate = [formatter stringFromDate:intent.created];
+
     return @{
              @"stripeId": intent.stripeId,
-             @"created": intent.created,
+             @"created": createdDate,
              @"status": @(intent.status),
              @"amount": @(intent.amount),
              @"currency": intent.currency,
@@ -263,6 +271,12 @@ RCT_EXPORT_METHOD(createPayment:(NSDictionary *)options) {
 
         SCPPaymentIntentParameters *params = [[SCPPaymentIntentParameters alloc] initWithAmount:amount currency:currency];
 
+        params.metadata = options[@"metadata"];
+        params.stripeDescription = options[@"description"];
+        params.statementDescriptor = options[@"statementDescription"];
+        params.receiptEmail = options[@"receiptEmail"];
+        params.customer = options[@"customer"];
+
         NSInteger applicationFeeAmount = [RCTConvert NSInteger:options[@"applicationFeeAmount"]];
         if (applicationFeeAmount) {
             params.applicationFeeAmount = [NSNumber numberWithInteger:applicationFeeAmount];
@@ -279,6 +293,12 @@ RCT_EXPORT_METHOD(createPaymentIntent:(NSDictionary *)options) {
     NSString *currency = [RCTConvert NSString:options[@"currency"]];
 
     SCPPaymentIntentParameters *params = [[SCPPaymentIntentParameters alloc] initWithAmount:amount currency:currency];
+
+    params.metadata = options[@"metadata"];
+    params.stripeDescription = options[@"description"];
+    params.statementDescriptor = options[@"statementDescription"];
+    params.receiptEmail = options[@"receiptEmail"];
+    params.customer = options[@"customer"];
 
     NSInteger applicationFeeAmount = [RCTConvert NSInteger:options[@"applicationFeeAmount"]];
 
@@ -330,6 +350,7 @@ RCT_EXPORT_METHOD(processPayment) {
         if (error) {
             [self sendEventWithName:@"paymentProcess" body:@{
                 @"error": [error localizedDescription],
+                @"apiError": [error localizedDescription],
                 @"code": @(error.code),
                 @"declineCode": error.declineCode ? error.declineCode : @"",
                 @"intent": [self serializePaymentIntent:intent]
@@ -403,11 +424,18 @@ RCT_EXPORT_METHOD(cancelPaymentIntent) {
 }
 
 - (void)reader:(nonnull SCPReader *)reader didFinishInstallingUpdate:(nullable SCPReaderSoftwareUpdate *)update error:(nullable NSError *)error {
-   [self sendEventWithName:@"didFinishInstallingUpdate" body:@{}];
+    if (error) {
+        [self sendEventWithName:@"didFinishInstallingUpdate" body:@{@"error": [error localizedDescription]}];
+    } else {
+        pendingInstallUpdate = nil;
+        readerSoftwareUpdate = nil;
+        [self sendEventWithName:@"didFinishInstallingUpdate" body:update ? [self serializeUpdate:update] : @{}];
+    }
 }
 
 - (void)reader:(nonnull SCPReader *)reader didReportAvailableUpdate:(nonnull SCPReaderSoftwareUpdate *)update {
-   [self sendEventWithName:@"didReportAvailableUpdate" body:@{}];
+    readerSoftwareUpdate = update;
+   [self sendEventWithName:@"didReportAvailableUpdate" body:[self serializeUpdate:update]];
 }
 
 - (void)reader:(nonnull SCPReader *)reader didReportReaderSoftwareUpdateProgress:(float)progress {
@@ -415,7 +443,9 @@ RCT_EXPORT_METHOD(cancelPaymentIntent) {
 }
 
 - (void)reader:(nonnull SCPReader *)reader didStartInstallingUpdate:(nonnull SCPReaderSoftwareUpdate *)update cancelable:(nullable SCPCancelable *)cancelable {
-    [self sendEventWithName:@"didStartInstallingUpdate" body:@{}];
+    readerSoftwareUpdate = update;
+    pendingInstallUpdate = cancelable;
+    [self sendEventWithName:@"didStartInstallingUpdate" body:update ? [self serializeUpdate:update] : @{}];
 }
 
 RCT_EXPORT_METHOD(clearCachedCredentials) {
@@ -444,8 +474,16 @@ RCT_EXPORT_METHOD(getConnectedReader) {
      reader ? [self serializeReader:reader] : @{}];
 }
 
+RCT_EXPORT_METHOD(installUpdate:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject) {
+    if (readerSoftwareUpdate) {
+        [SCPTerminal.shared installAvailableUpdate];
+    }
+    resolve([self serializeUpdate:readerSoftwareUpdate]);
+}
+
 RCT_EXPORT_METHOD(abortCreatePayment) {
-    if (pendingCreatePaymentIntent) {
+    if (pendingCreatePaymentIntent && !pendingCreatePaymentIntent.completed) {
         [pendingCreatePaymentIntent cancel:^(NSError * _Nullable error) {
             if (error) {
                 [self sendEventWithName:@"abortCreatePaymentCompletion" body:@{@"error": [error localizedDescription]}];
@@ -461,7 +499,7 @@ RCT_EXPORT_METHOD(abortCreatePayment) {
 }
 
 RCT_EXPORT_METHOD(abortDiscoverReaders) {
-    if (pendingDiscoverReaders) {
+    if (pendingDiscoverReaders && !pendingDiscoverReaders.completed) {
         [pendingDiscoverReaders cancel:^(NSError * _Nullable error) {
             if (error) {
                 [self sendEventWithName:@"abortDiscoverReadersCompletion" body:@{@"error": [error localizedDescription]}];
@@ -477,7 +515,7 @@ RCT_EXPORT_METHOD(abortDiscoverReaders) {
 }
 
 RCT_EXPORT_METHOD(abortInstallUpdate) {
-    if (pendingInstallUpdate) {
+    if (pendingInstallUpdate && !pendingInstallUpdate.completed) {
         [pendingInstallUpdate cancel:^(NSError * _Nullable error) {
             if (error) {
                 [self sendEventWithName:@"abortInstallUpdateCompletion" body:@{@"error": [error localizedDescription]}];
